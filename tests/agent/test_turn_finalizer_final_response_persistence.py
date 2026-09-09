@@ -133,6 +133,96 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert agent.persisted_messages[-1] == result["messages"][-1]
 
 
+def test_persistence_receipt_covers_transformed_delivery_payload(monkeypatch):
+    """The durable assistant row must match the post-transform delivery payload."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        "agent.turn_finalizer._append_file_mutation_footer",
+        lambda _agent, response, _logger: response + " [footer]",
+    )
+    monkeypatch.setattr(
+        "agent.turn_finalizer._explain_abnormal_exit",
+        lambda _agent, response, *_args: response + " [explanation]",
+    )
+    monkeypatch.setattr(
+        "agent.turn_finalizer._apply_output_hooks",
+        lambda _agent, response, *_args, **_kwargs: (response + " [hook]", True, response),
+    )
+    observed = {}
+    monkeypatch.setattr(
+        "agent.turn_finalizer._emit_post_llm_call",
+        lambda _agent, response, _logger, **kwargs: observed.update(
+            response=response, messages=[dict(message) for message in kwargs["messages"]]
+        ),
+    )
+    agent = FakeAgent()
+    messages = [{"role": "user", "content": "do it"}]
+
+    result = finalize_turn(
+        agent,
+        final_response="answer",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="do it",
+        original_user_message="do it",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    delivered = "answer [footer] [explanation] [hook]"
+    assert result["final_response"] == delivered
+    assert result["persistence_confirmed"] is True
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1]["content"] == delivered
+    assert observed["response"] == delivered
+    assert observed["messages"][-1]["content"] == delivered
+
+
+def test_post_hook_is_exactly_once_and_only_after_persistence(monkeypatch):
+    """The real output-hook path must emit post_llm_call after persistence only."""
+    agent = FakeAgent()
+    events = []
+
+    def dispatcher(name, _logger, **kwargs):
+        if name in {"transform_llm_output", "post_llm_call"}:
+            events.append((name, agent.persisted_messages is not None))
+        if name == "transform_llm_output":
+            return ["answer [transformed]"]
+        return []
+
+    monkeypatch.setattr("agent.turn_finalizer._invoke_hook_safely", dispatcher)
+    messages = [{"role": "user", "content": "do it"}]
+
+    result = finalize_turn(
+        agent,
+        final_response="answer",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="do it",
+        original_user_message="do it",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert result["persistence_confirmed"] is True
+    assert events == [
+        ("transform_llm_output", False),
+        ("post_llm_call", True),
+    ]
+    assert agent.persisted_messages[-1]["content"] == "answer [transformed]"
+    assert result["final_response"] == "answer [transformed]"
+
+
 def test_fallback_timestamp_survives_delayed_sqlite_persistence(
     monkeypatch, tmp_path
 ):
@@ -379,6 +469,11 @@ def test_persist_step_failure_is_not_external_delivery_proof(monkeypatch):
     persistence receipt, the result must not expose a final response.
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    post_calls = []
+    monkeypatch.setattr(
+        "agent.turn_finalizer._emit_post_llm_call",
+        lambda *_args, **_kwargs: post_calls.append(True),
+    )
     agent = FakeAgent()
     agent._current_streamed_assistant_text = "  streamed answer  "
 
@@ -410,6 +505,7 @@ def test_persist_step_failure_is_not_external_delivery_proof(monkeypatch):
     assert result["persistence_confirmed"] is False
     assert result["turn_exit_reason"] == "session_persistence_failed"
     assert result["cleanup_errors"] == ["persist_session: override exploded"]
+    assert post_calls == []
     # The blank tail was filled before the raise (same order as the inline BASE block).
     assert messages[-1]["content"] == "streamed answer"
 

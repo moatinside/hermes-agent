@@ -399,9 +399,9 @@ def _last_turn_reasoning(messages) -> Optional[Any]:
 
 def _apply_output_hooks(
     agent, final_response, logger, *, platform, effective_task_id, turn_id, original_user_message,
-    messages,
+    messages, emit_post_hook=True,
 ) -> Tuple[Any, bool, Optional[Any]]:
-    """Fire ``transform_llm_output`` then ``post_llm_call`` once per turn after the tool loop.
+    """Fire ``transform_llm_output`` and optionally ``post_llm_call`` after the tool loop.
     Returns ``(final_response, transformed, pre_transform_response)``."""
     transformed, pre_transform = False, None
     # First hook to return a string wins; None/empty leaves the text unchanged.
@@ -415,7 +415,18 @@ def _apply_output_hooks(
         if isinstance(_hook_result, str) and _hook_result:
             pre_transform, final_response, transformed = final_response, _hook_result, True
             break
-    # post_llm_call (e.g. sync conversation data to an external memory system).
+    if emit_post_hook:
+        _emit_post_llm_call(
+            agent, final_response, logger, platform=platform, effective_task_id=effective_task_id,
+            turn_id=turn_id, original_user_message=original_user_message, messages=messages,
+        )
+    return final_response, transformed, pre_transform
+
+
+def _emit_post_llm_call(
+    agent, final_response, logger, *, platform, effective_task_id, turn_id, original_user_message, messages,
+) -> None:
+    """Notify external observers only after the canonical persistence receipt exists."""
     _invoke_hook_safely(
         "post_llm_call", logger,
         session_id=agent.session_id,
@@ -427,7 +438,6 @@ def _apply_output_hooks(
         model=agent.model,
         platform=platform,
     )
-    return final_response, transformed, pre_transform
 
 
 def finalize_turn(
@@ -461,6 +471,9 @@ def finalize_turn(
     _rollback_interrupted_preflight_display(agent, interrupted)
 
     _cleanup_errors: List[str] = []
+    _platform = getattr(agent, "platform", None) or ""
+    _response_transformed = False
+    _pre_transform_response = None
 
     # ``user_message`` may be a multimodal list of parts; the trajectory format wants a string.
     _guarded_cleanup(
@@ -472,11 +485,8 @@ def finalize_turn(
         "cleanup_task_resources", lambda: agent._cleanup_task_resources(effective_task_id),
         _cleanup_errors, logger,
     )
-    # Persist only after the transcript tail is shaped and scaffolding removed. Each
-    # sub-step runs in the same order as the original inline block. The stream-recovered
-    # response is rebound before the fallible work so the durable transcript is shaped
-    # consistently; if any step fails, _mark_persistence_failed() invalidates the
-    # response and blocks external delivery.
+    # Resolve every response transformation before canonical persistence. The receipt
+    # must certify the exact payload that will later be evaluated and delivered.
     def _mark_persistence_failed():
         nonlocal final_response, failed, completed, _turn_exit_reason, persistence_confirmed
         persistence_confirmed = False
@@ -489,11 +499,26 @@ def finalize_turn(
 
     def _persist_step():
         nonlocal final_response, failed, _turn_exit_reason, persistence_confirmed
+        nonlocal _response_transformed, _pre_transform_response
         try:
             _drop_transcript_scaffolding(agent, messages)
             final_response, _recovered_from_stream = _recover_final_from_stream(
                 agent, final_response, interrupted, failed
             )
+            if final_response and not interrupted:
+                final_response = _append_file_mutation_footer(agent, final_response, logger)
+            if not interrupted:
+                final_response = _explain_abnormal_exit(
+                    agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
+                )
+            if final_response and not interrupted:
+                final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
+                    agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
+                    turn_id=turn_id, original_user_message=original_user_message, messages=messages,
+                    emit_post_hook=False,
+                )
+            if isinstance(final_response, str):
+                final_response = _sanitize_surrogates(final_response)
             _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
             if not interrupted and not failed:
                 _micro_compact_after_turn(agent, messages, final_response, logger)
@@ -508,6 +533,12 @@ def finalize_turn(
 
     _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
 
+    if persistence_confirmed and final_response and not interrupted:
+        _emit_post_llm_call(
+            agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
+            turn_id=turn_id, original_user_message=original_user_message, messages=messages,
+        )
+
     # Keep the gateway's separate in-memory history snapshot current even on
     # cleanup error, so a later prompt isn't sent with a pre-turn snapshot.
     with suppress(Exception):
@@ -515,22 +546,6 @@ def finalize_turn(
 
     _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_reason, interrupted, logger)
 
-    # Response transforms apply only to real, uninterrupted responses.
-    if final_response and not interrupted:
-        final_response = _append_file_mutation_footer(agent, final_response, logger)
-    if not interrupted:
-        final_response = _explain_abnormal_exit(
-            agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
-        )
-
-    _platform = getattr(agent, "platform", None) or ""
-    _response_transformed = False
-    _pre_transform_response = None
-    if final_response and not interrupted:
-        final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
-            agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
-            turn_id=turn_id, original_user_message=original_user_message, messages=messages,
-        )
 
 
     # Context engine observation hook: the turn finished with the finalized transcript.
@@ -554,8 +569,6 @@ def finalize_turn(
     # consumers — oneshot stdout writes, Telegram's ``utf16_len`` length check, Signal formatting, JSON
     # envelope encodes — on every provider (Ollama, NVIDIA NIM, …). Scrub once here, where model text leaves
     # the conversation loop, so every delivery surface receives valid Unicode.
-    if isinstance(final_response, str):
-        final_response = _sanitize_surrogates(final_response)
 
     result = {
         "final_response": final_response,
