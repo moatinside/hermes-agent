@@ -2728,6 +2728,7 @@ class GatewayTurnMixin:
             _run_still_current=self._run_still_current_fn(session_key, run_generation),
             progress_queue=queue.Queue() if disp.needs_progress_queue else None,
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
+            pre_delivery_gate=getattr(self, "pre_delivery_gate", None),
             **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
         )
         turn_runner = TurnRunner(self, turn_ctx)
@@ -2900,14 +2901,15 @@ class GatewayTurnMixin:
             )
             if _stts_consumer.active:
                 streaming_tts_consumer_holder[0] = _stts_consumer
-                _stts_consumer.start()
         except Exception as _stts_err:
             logger.debug("Could not set up streaming TTS consumer: %s", _stts_err)
 
-    async def _run_agent_stream_consumer_task(self, stream_consumer_holder: list) -> None:
-        """Wait (up to 10s) for the stream consumer to be created inside run_sync, then run it."""
+    async def _run_agent_stream_consumer_task(self, stream_consumer_holder: list, release_event=None) -> None:
+        """Wait for consumer creation and persistence release before external delivery."""
         for _ in range(200):
             if stream_consumer_holder[0] is not None:
+                if release_event is not None:
+                    await release_event.wait()
                 await stream_consumer_holder[0].run()
                 return
             await asyncio.sleep(0.05)
@@ -3255,13 +3257,29 @@ class GatewayTurnMixin:
         if _agent.model != _cfg_model and not self._is_intentional_model_switch(session_key, _agent.model):
             self._evict_cached_agent(session_key)
 
-    async def _run_agent_finalize_streaming_tts(self, turn_ctx: TurnContext, adapter: Any) -> None:
+    async def _run_agent_finalize_streaming_tts(
+        self, turn_ctx: TurnContext, adapter: Any, result: Any = None,
+    ) -> None:
         """Finalize the streaming-TTS consumer on the outer event-loop thread (covers early returns
         from run_sync). On drain timeout abort to free the task — audible streams keep whole-file
         suppression, silent streams stay eligible for the whole-file fallback."""
         _stts = turn_ctx.streaming_tts_consumer_holder[0]
         if _stts is None:
             return
+        # Deltas are queued before start(); do not open an external audio stream
+        # until the turn result carries an explicit positive persistence receipt.
+        # Missing/unknown/failed/interrupted results are all fail-closed.
+        if not (
+            isinstance(result, dict)
+            and result.get("persistence_confirmed") is True
+            and result.get("completed") is True
+            and not result.get("failed")
+            and not result.get("interrupted")
+        ):
+            _stts.abort("canonical persistence not confirmed before streaming TTS start")
+            return
+        if _stts._task is None:
+            _stts.start()
         _stts.finish()
         try:
             await _stts.wait_complete(timeout=10.0)
@@ -3274,6 +3292,66 @@ class GatewayTurnMixin:
             _mark_turn = getattr(adapter, "_mark_streaming_tts_completed_turn", None)
             if callable(_mark_turn):
                 _mark_turn(turn_ctx.session_key, turn_ctx.run_generation)
+
+    async def _run_agent_apply_pre_delivery_gate(self, turn_ctx: TurnContext, result: Any) -> Any:
+        """Run the optional policy seam after persistence and before egress.
+
+        The default path is unchanged. Shadow callbacks are observational: their
+        bounded return value is attached to the in-memory result, while the
+        original response remains the delivery payload. Strict enforcement is
+        intentionally out of scope for this seam.
+        """
+        gate = turn_ctx.pre_delivery_gate
+        if gate is None or not isinstance(result, dict):
+            return result
+        try:
+            outcome = gate(result, turn_ctx)
+            if inspect.isawaitable(outcome):
+                outcome = await outcome
+            if outcome is not None:
+                result["pre_delivery_gate_result"] = outcome
+        except Exception as exc:
+            # Shadow must preserve the existing response while exposing an
+            # explicit inconclusive observation to the caller.
+            result["pre_delivery_gate_result"] = {
+                "decision": "inconclusive",
+                "error_code": "pre_delivery_gate_error",
+            }
+            logger.warning("Pre-delivery shadow gate failed: %s", type(exc).__name__)
+        return result
+
+    def _run_agent_release_stream_consumer(self, turn_ctx: TurnContext, result: Any) -> None:
+        """Finalize and release the stream only after the pre-delivery gate."""
+        stream_consumer = turn_ctx.stream_consumer_holder[0]
+        if stream_consumer is None:
+            return
+        final_for_stream = None
+        if (
+            isinstance(result, dict)
+            and not result.get("failed")
+            and not result.get("interrupted")
+            and result.get("completed") is not False
+        ):
+            final_response = result.get("final_response")
+            if isinstance(final_response, str) and final_response.strip() and final_response != "(empty)":
+                final_for_stream = final_response
+        if final_for_stream is None:
+            stream_consumer.finish()
+            return
+        try:
+            stream_consumer.finish(final_for_stream)
+        except TypeError:
+            stream_consumer.finish()
+        if (
+            isinstance(result, dict)
+            and result.get("persistence_confirmed") is True
+            and result.get("completed") is True
+            and not result.get("failed")
+            and not result.get("interrupted")
+        ):
+            release_event = turn_ctx.stream_release_event
+            if release_event is not None:
+                release_event.set()
 
     async def _run_agent_drain_pending(
         self, result: Any, adapter: Any, source: SessionSource, session_key: Optional[str]
@@ -3806,6 +3884,7 @@ class GatewayTurnMixin:
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
+        turn_ctx.stream_release_event = asyncio.Event()
         self._run_agent_start_streaming_tts(
             source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
         )
@@ -3815,7 +3894,9 @@ class GatewayTurnMixin:
         progress_task = spawn(turn_runner.send_progress_messages()) if disp.needs_progress_queue else None
         log_task = spawn(self._run_agent_write_tool_log(disp.log_queue)) if disp.log_mode_enabled else None
         # The stream consumer is created inside run_sync; this task polls for it.
-        stream_task = spawn(self._run_agent_stream_consumer_task(turn_ctx.stream_consumer_holder))
+        stream_task = spawn(self._run_agent_stream_consumer_task(
+            turn_ctx.stream_consumer_holder, turn_ctx.stream_release_event,
+        ))
         tracking_task = spawn(self._run_agent_track_agent(turn_ctx))
         _interrupt_detected = asyncio.Event()  # shared with backup check
         interrupt_monitor = spawn(self._run_agent_monitor_for_interrupt(turn_ctx, _interrupt_detected))
@@ -3833,7 +3914,10 @@ class GatewayTurnMixin:
             # Interrupted OR queued message (/queue)?
             result = turn_ctx.result_holder[0]
             adapter = self._adapter_for_source(source)
-            await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
+            result = await self._run_agent_apply_pre_delivery_gate(turn_ctx, result)
+            turn_ctx.result_holder[0] = result
+            self._run_agent_release_stream_consumer(turn_ctx, result)
+            await self._run_agent_finalize_streaming_tts(turn_ctx, adapter, result)
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
