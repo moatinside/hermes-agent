@@ -2478,9 +2478,11 @@ class GatewayTurnMixin:
             headers["X-Hermes-Session-Id"] = session_id
         body = {"model": "hermes-agent", "messages": api_messages, "stream": True}
 
+        _gated_proxy = getattr(self, "pre_delivery_gate", None) is not None
+        _remote_persistence_confirmed = False
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
         _stream_consumer = self._proxy_stream_consumer(source, event_message_id, _thread_metadata, _run_still_current)
-        stream_task = asyncio.create_task(_stream_consumer.run()) if _stream_consumer else None
+        stream_task = asyncio.create_task(_stream_consumer.run()) if _stream_consumer and not _gated_proxy else None
 
         _adapter = self._adapter_for_source(source)
         if _adapter:
@@ -2512,13 +2514,17 @@ class GatewayTurnMixin:
                             if data.strip() == "[DONE]":
                                 break
                             try:
-                                choices = json.loads(data).get("choices", [])
+                                _payload = json.loads(data)
+                                choices = _payload.get("choices", [])
+                                _hermes = _payload.get("hermes")
+                                if isinstance(_hermes, dict) and "persistence_confirmed" in _hermes:
+                                    _remote_persistence_confirmed = _hermes["persistence_confirmed"] is True
                             except json.JSONDecodeError:
                                 continue
                             content = choices[0].get("delta", {}).get("content", "") if choices else ""
                             if content:
                                 full_response += content
-                                if _stream_consumer:
+                                if _stream_consumer and not _gated_proxy:
                                     _stream_consumer.on_delta(content)
                         if len(buffer) > _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS:
                             raise ValueError("Proxy SSE stream exceeded max buffer size without a line boundary")
@@ -2530,9 +2536,9 @@ class GatewayTurnMixin:
                 return self._proxy_error_result(f"⚠️ Proxy connection error: {e}")
             # Partial response — return what we got
         finally:
-            if _stream_consumer:
+            if _stream_consumer and not _gated_proxy:
                 _stream_consumer.finish()
-            if stream_task:
+            if stream_task and not _gated_proxy:
                 try:
                     await asyncio.wait_for(stream_task, timeout=5.0)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -2545,7 +2551,7 @@ class GatewayTurnMixin:
             "proxy response: url=%s session=%s time=%.1fs response=%d chars",
             proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
         )
-        return {
+        result = {
             "final_response": full_response or "(No response from remote agent)",
             "messages": [
                 {"role": "user", "content": message},
@@ -2556,7 +2562,27 @@ class GatewayTurnMixin:
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
+            "completed": True,
+            "failed": False,
+            "interrupted": False,
+            "persistence_confirmed": _remote_persistence_confirmed,
         }
+        if _gated_proxy:
+            _turn_ctx = TurnContext(
+                source=source, session_key=session_key,
+                pre_delivery_gate=getattr(self, "pre_delivery_gate", None),
+            )
+            result = await self._run_agent_apply_pre_delivery_gate(_turn_ctx, result)
+            if result.get("persistence_confirmed") is not True:
+                result["failed"] = True
+                result["completed"] = False
+                result["final_response"] = ""
+            elif _stream_consumer:
+                _stream_consumer.on_delta(full_response)
+                _stream_consumer.finish(result.get("final_response"))
+                stream_task = asyncio.create_task(_stream_consumer.run())
+                await self._await_stream_task(stream_task)
+        return result
 
     async def _run_agent(
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
