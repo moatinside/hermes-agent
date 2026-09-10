@@ -485,8 +485,11 @@ def finalize_turn(
         "cleanup_task_resources", lambda: agent._cleanup_task_resources(effective_task_id),
         _cleanup_errors, logger,
     )
-    # Resolve every response transformation before canonical persistence. The receipt
-    # must certify the exact payload that will later be evaluated and delivered.
+    # Persist only after the transcript tail is shaped and scaffolding removed. Each
+    # sub-step runs in the same order as the original inline block. The stream-recovered
+    # response is rebound before the fallible work so the durable transcript is shaped
+    # consistently; if any step fails, _mark_persistence_failed() invalidates the
+    # response and blocks external delivery.
     def _mark_persistence_failed():
         nonlocal final_response, failed, completed, _turn_exit_reason, persistence_confirmed
         persistence_confirmed = False
@@ -545,6 +548,7 @@ def finalize_turn(
         agent._session_messages = messages
 
     _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_reason, interrupted, logger)
+
 
 
 
