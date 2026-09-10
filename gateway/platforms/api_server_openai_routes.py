@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover - mirrors api_server's optional import
 
 # Logger parity with the origin module (moved log records keep their name).
 logger = logging.getLogger("gateway.platforms.api_server")
+_EXPLICIT_RUNNER_UNSET = object()
 
 async def _iter_stream_items(stream_q, agent_task, response):
     """Yield agent stream items until EOS, writing SSE keepalives while idle.
@@ -407,14 +408,18 @@ class OpenAICompatRoutesMixin:
         agent_task.add_done_callback(lambda _fut: stream_q.put_nowait(None))
         return agent_task, agent_ref
 
-    def _api_pre_delivery_gate(self, request, session_id):
+    def _api_pre_delivery_gate(self, request, session_id, *, explicit_runner=_EXPLICIT_RUNNER_UNSET):
         """Return the owning gateway's optional gate and a request-scoped context.
 
         API-server SSE bypasses ``GatewayRunner._run_agent_inner`` and therefore
         must call the same configured seam explicitly.  No gate means legacy
-        behavior; the caller only buffers when this returns a gate.
+        behavior; the caller only buffers when this returns a gate.  Background
+        tasks may pass the runner captured at admission so later adapter mutation
+        cannot change the policy for an already admitted run.
         """
-        runner = getattr(self, "gateway_runner", None)
+        runner = explicit_runner
+        if runner is _EXPLICIT_RUNNER_UNSET:
+            runner = getattr(self, "gateway_runner", None)
         if runner is None:
             with suppress(Exception):
                 candidate = request.app.get("gateway_runner")
@@ -438,8 +443,9 @@ class OpenAICompatRoutesMixin:
         )
         return runner, ctx
 
-    async def _apply_api_pre_delivery_gate(self, request, session_id, result):
-        runner, ctx = self._api_pre_delivery_gate(request, session_id)
+    async def _apply_api_pre_delivery_gate(self, request, session_id, result, *, explicit_runner=_EXPLICIT_RUNNER_UNSET):
+        runner, ctx = self._api_pre_delivery_gate(
+            request, session_id, explicit_runner=explicit_runner)
         if runner is None:
             return result
         apply_gate = getattr(runner, "_run_agent_apply_pre_delivery_gate", None)
@@ -476,12 +482,14 @@ class OpenAICompatRoutesMixin:
         gate_result = result.get("pre_delivery_gate_result")
         return not (isinstance(gate_result, dict) and gate_result.get("decision") == "inconclusive")
 
-    async def _apply_api_gate_to_result(self, request, session_id, result):
+    async def _apply_api_gate_to_result(self, request, session_id, result, *, explicit_runner=_EXPLICIT_RUNNER_UNSET):
         """Apply the configured gate before any non-streaming API body is built."""
-        runner, _ctx = self._api_pre_delivery_gate(request, session_id)
+        runner, _ctx = self._api_pre_delivery_gate(
+            request, session_id, explicit_runner=explicit_runner)
         if runner is None:
             return result
-        result = await self._apply_api_pre_delivery_gate(request, session_id, result)
+        result = await self._apply_api_pre_delivery_gate(
+            request, session_id, result, explicit_runner=explicit_runner)
         if not self._api_sse_release_allowed(result):
             if isinstance(result, dict):
                 result["failed"] = True
@@ -822,6 +830,9 @@ class OpenAICompatRoutesMixin:
                         buffered_items.append(gated_text)
                 else:
                     buffered_items = []
+                    st.final_text_parts = []
+                    st.final_response_text = ""
+                    st.emitted_items = []
                     if st.agent_error is None:
                         st.agent_error = "pre-delivery gate did not approve a complete response"
             if gated:

@@ -336,10 +336,10 @@ class SessionPersistenceMixin:
             self._session_messages = messages
             self._save_session_log(messages)
             persisted = self._flush_messages_to_session_db(messages, conversation_history)
-            if persisted is False:
-                # Do not clear the in-flight marker when the canonical DB write failed.
-                # The caller must observe the failure and fail closed rather than treating
-                # an in-memory turn as durable.
+            if persisted is not True:
+                # Do not clear the in-flight marker when the canonical DB write failed,
+                # or when no canonical SessionDB was available. The caller must observe
+                # the failure and fail closed rather than treating an in-memory turn as durable.
                 return False
             # Drain async token-accounting deltas at every persist point; cheap no-op when nothing queued.
             if self._session_db is not None:
