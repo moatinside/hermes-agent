@@ -2573,7 +2573,17 @@ class GatewayTurnMixin:
                 pre_delivery_gate=getattr(self, "pre_delivery_gate", None),
             )
             result = await self._run_agent_apply_pre_delivery_gate(_turn_ctx, result)
-            if result.get("persistence_confirmed") is not True:
+            if (
+                result.get("persistence_confirmed") is not True
+                or result.get("completed") is not True
+                or result.get("partial")
+                or result.get("failed")
+                or result.get("interrupted")
+                or (
+                    isinstance(result.get("pre_delivery_gate_result"), dict)
+                    and result["pre_delivery_gate_result"].get("decision") == "inconclusive"
+                )
+            ):
                 result["failed"] = True
                 result["completed"] = False
                 result["final_response"] = ""
@@ -3301,6 +3311,10 @@ class GatewayTurnMixin:
             and result.get("completed") is True
             and not result.get("failed")
             and not result.get("interrupted")
+            and not (
+                isinstance(result.get("pre_delivery_gate_result"), dict)
+                and result["pre_delivery_gate_result"].get("decision") == "inconclusive"
+            )
         ):
             _stts.abort("canonical persistence not confirmed before streaming TTS start")
             return
@@ -3357,6 +3371,10 @@ class GatewayTurnMixin:
             and not result.get("failed")
             and not result.get("interrupted")
             and result.get("completed") is not False
+            and not (
+                isinstance(result.get("pre_delivery_gate_result"), dict)
+                and result["pre_delivery_gate_result"].get("decision") == "inconclusive"
+            )
         ):
             final_response = result.get("final_response")
             if isinstance(final_response, str) and final_response.strip() and final_response != "(empty)":
