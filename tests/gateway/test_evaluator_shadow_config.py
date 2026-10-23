@@ -108,6 +108,9 @@ def test_runner_rejects_whitespace_shadow_ids(monkeypatch, tmp_path):
 def test_mode_defaults_to_shadow():
     assert EvaluatorShadowConfig().mode == "shadow"
     assert EvaluatorShadowConfig.from_dict({}).mode == "shadow"
+    assert EvaluatorShadowConfig().capture_runtime_evidence is False
+    assert EvaluatorShadowConfig().allowed_platforms == []
+    assert EvaluatorShadowConfig().allowed_chat_refs == []
 
 
 def test_mode_accepts_strict_and_rejects_unknown_values():
@@ -144,6 +147,34 @@ def test_complete_shadow_config_keeps_shadow_mode(tmp_path):
     runner._init_evaluator_shadow()
     assert runner.pre_delivery_gate is not None
     assert runner.pre_delivery_gate_mode == "shadow"
+
+
+def test_runtime_capture_requires_explicit_shadow_scope(tmp_path):
+    chat_ref = "sha256:" + "c" * 64
+    config = _complete_shadow_dict(
+        tmp_path,
+        capture_runtime_evidence=True,
+        allowed_platforms=["DISCORD"],
+        allowed_chat_refs=[chat_ref],
+        required_patterns=["task complete"],
+        forbidden_patterns=["secret"],
+    )
+    runner = _runner(config)
+    runner._init_evaluator_shadow()
+    assert runner.pre_delivery_gate is not None
+    assert runner.pre_delivery_gate.capture_runtime_evidence is True
+    assert runner.pre_delivery_gate.allowed_platforms == {"discord"}
+    assert runner.pre_delivery_gate.allowed_chat_refs == {chat_ref}
+    assert runner.pre_delivery_gate.required_patterns == ["task complete"]
+    assert runner.pre_delivery_gate.forbidden_patterns == ["secret"]
+
+
+def test_runtime_capture_is_disabled_without_scope_even_when_requested(tmp_path):
+    config = _complete_shadow_dict(tmp_path, capture_runtime_evidence=True)
+    runner = _runner(config)
+    runner._init_evaluator_shadow()
+    assert runner.pre_delivery_gate is not None
+    assert runner.pre_delivery_gate.capture_runtime_evidence is False
 
 
 def test_incomplete_strict_config_stays_disabled(tmp_path, caplog):

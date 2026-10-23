@@ -2609,10 +2609,7 @@ class GatewayTurnMixin:
                 or result.get("partial")
                 or result.get("failed")
                 or result.get("interrupted")
-                or (
-                    isinstance(result.get("pre_delivery_gate_result"), dict)
-                    and result["pre_delivery_gate_result"].get("decision") == "inconclusive"
-                )
+                or self._run_agent_should_withhold_pre_delivery_inconclusive(result)
             ):
                 result["failed"] = True
                 result["completed"] = False
@@ -3341,10 +3338,7 @@ class GatewayTurnMixin:
             and result.get("completed") is True
             and not result.get("failed")
             and not result.get("interrupted")
-            and not (
-                isinstance(result.get("pre_delivery_gate_result"), dict)
-                and result["pre_delivery_gate_result"].get("decision") == "inconclusive"
-            )
+            and not self._run_agent_should_withhold_pre_delivery_inconclusive(result)
         ):
             _stts.abort("canonical persistence not confirmed before streaming TTS start")
             return
@@ -3390,6 +3384,19 @@ class GatewayTurnMixin:
             logger.warning("Pre-delivery shadow gate failed: %s", type(exc).__name__)
         return result
 
+    def _run_agent_should_withhold_pre_delivery_inconclusive(self, result: Any) -> bool:
+        """Only Strict enforcement may suppress an inconclusive gate result.
+
+        Shadow records an observation after the canonical response is complete;
+        its evaluator outcome must not change delivery or streaming behavior.
+        """
+        return (
+            getattr(self, "pre_delivery_gate_mode", "shadow") == "strict"
+            and isinstance(result, dict)
+            and isinstance(result.get("pre_delivery_gate_result"), dict)
+            and result["pre_delivery_gate_result"].get("decision") == "inconclusive"
+        )
+
     def _run_agent_release_stream_consumer(self, turn_ctx: TurnContext, result: Any) -> None:
         """Finalize and release the stream only after the pre-delivery gate."""
         stream_consumer = turn_ctx.stream_consumer_holder[0]
@@ -3401,10 +3408,7 @@ class GatewayTurnMixin:
             and not result.get("failed")
             and not result.get("interrupted")
             and result.get("completed") is not False
-            and not (
-                isinstance(result.get("pre_delivery_gate_result"), dict)
-                and result["pre_delivery_gate_result"].get("decision") == "inconclusive"
-            )
+            and not self._run_agent_should_withhold_pre_delivery_inconclusive(result)
         ):
             final_response = result.get("final_response")
             if isinstance(final_response, str) and final_response.strip() and final_response != "(empty)":

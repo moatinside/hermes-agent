@@ -554,6 +554,11 @@ class EvaluatorShadowConfig:
     agent_configuration_id: Optional[str] = None
     evaluator_configuration_id: Optional[str] = None
     timeout_seconds: float = 10.0
+    allowed_platforms: List[str] = field(default_factory=list)
+    allowed_chat_refs: List[str] = field(default_factory=list)
+    required_patterns: List[str] = field(default_factory=list)
+    forbidden_patterns: List[str] = field(default_factory=list)
+    capture_runtime_evidence: bool = False
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "EvaluatorShadowConfig":
@@ -561,6 +566,14 @@ class EvaluatorShadowConfig:
         timeout = _coerce_float(data.get("timeout_seconds"), 10.0)
         if not math.isfinite(timeout) or timeout <= 0 or timeout > 300:
             timeout = 10.0
+        raw_platforms = data.get("allowed_platforms", [])
+        platforms = sorted({item.strip().lower() for item in raw_platforms if isinstance(item, str) and item.strip()}) if isinstance(raw_platforms, list) else []
+        raw_chat_refs = data.get("allowed_chat_refs", [])
+        chat_refs = sorted({item.strip() for item in raw_chat_refs if isinstance(item, str) and item.strip()}) if isinstance(raw_chat_refs, list) else []
+        raw_required_patterns = data.get("required_patterns", [])
+        required_patterns = [item for item in raw_required_patterns if isinstance(item, str)] if isinstance(raw_required_patterns, list) else []
+        raw_forbidden_patterns = data.get("forbidden_patterns", [])
+        forbidden_patterns = [item for item in raw_forbidden_patterns if isinstance(item, str)] if isinstance(raw_forbidden_patterns, list) else []
         return cls(
             enabled=_coerce_bool(data.get("enabled"), False),
             mode=_normalize_choice(data.get("mode"), {"shadow", "strict"}, "shadow"),
@@ -569,6 +582,11 @@ class EvaluatorShadowConfig:
             agent_configuration_id=data.get("agent_configuration_id") if isinstance(data.get("agent_configuration_id"), str) else None,
             evaluator_configuration_id=data.get("evaluator_configuration_id") if isinstance(data.get("evaluator_configuration_id"), str) else None,
             timeout_seconds=timeout,
+            allowed_platforms=platforms,
+            allowed_chat_refs=chat_refs,
+            required_patterns=required_patterns,
+            forbidden_patterns=forbidden_patterns,
+            capture_runtime_evidence=_coerce_bool(data.get("capture_runtime_evidence"), False),
         )
 
     def to_dict(self) -> Dict[str, Any]:
