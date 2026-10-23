@@ -293,6 +293,24 @@ def _first_nonzero(obj: Any, *paths: tuple[str, ...]) -> int:
     return next((v for v in (_usage_field(obj, *path) for path in paths) if v), 0)
 
 
+def _usage_as_dict(value: Any) -> Optional[dict[str, Any]]:
+    """Preserve provider-native usage fields from dict and SDK model objects."""
+    if isinstance(value, dict):
+        return dict(value)
+    for method_name in ("model_dump", "dict", "to_dict"):
+        method = getattr(value, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            dumped = method()
+        except Exception:
+            continue
+        if isinstance(dumped, dict):
+            return dumped
+    attrs = getattr(value, "__dict__", None)
+    return dict(attrs) if isinstance(attrs, dict) else None
+
+
 # Picker slugs → snapshot provider key ("openai-api" is the slug for direct
 # api.openai.com). Google and Fireworks are matched by name OR host below.
 _SNAPSHOT_PROVIDER_ALIASES = {
@@ -524,6 +542,7 @@ def normalize_usage(
     return CanonicalUsage(
         input_tokens=input_tokens, output_tokens=output_tokens, cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens, reasoning_tokens=reasoning_tokens,
+        raw_usage=_usage_as_dict(u),
     )
 
 
@@ -536,6 +555,18 @@ def estimate_usage_cost(
     base_url: Optional[str] = None, api_key: Optional[str] = None,
 ) -> CostResult:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+    # Provider plugins may expose request-native accounting that cannot be inferred from
+    # generic token pricing. Keep the hook optional and fall through when absent or unknown.
+    try:
+        from providers import get_provider_profile
+        profile = get_provider_profile(provider) if provider else None
+        profile_cost = getattr(profile, "get_usage_cost", None)
+        if callable(profile_cost):
+            native_result = profile_cost(model_name, usage)
+            if isinstance(native_result, CostResult) and native_result.status != "unknown":
+                return native_result
+    except Exception as exc:
+        logger.debug("provider profile cost lookup failed for %s/%s: %s", provider, model_name, exc)
     if route.billing_mode == "subscription_included":
         return CostResult(
             amount_usd=_ZERO, status="included", source="none", label="included",

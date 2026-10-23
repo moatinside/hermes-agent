@@ -78,6 +78,9 @@ class ProviderProfile:
     # top-level fields rather than ignoring them.
     supports_prompt_cache_key: bool = False
 
+    # Private replay carriers use a namespaced '<provider>.native_assistant' type.
+    native_reasoning_details_type: str | None = None
+
     # ── External-process providers (auth_type="external_process") ──
     # An agent CLI driven over stdio (ACP) rather than an HTTP endpoint. These
     # describe how to launch it; hermes_cli/auth.py's
@@ -93,6 +96,8 @@ class ProviderProfile:
     # fallback_models: curated list shown in /model picker when live fetch fails.
     # Only agentic models that support tool calling should appear here.
     fallback_models: tuple = ()
+    # Alias -> canonical model id for providers with a non-HTTP catalog.
+    model_aliases: dict = field(default_factory=dict)
 
     # hostname: base hostname for URL→provider reverse-mapping in model_metadata.py
     # e.g. "api.gmi-serving.com". Derived from base_url when empty.

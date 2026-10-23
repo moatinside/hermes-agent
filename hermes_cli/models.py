@@ -1272,6 +1272,17 @@ def _profile_live_catalog(normalized: str) -> Optional[list[str]]:
     from providers import get_provider_profile
 
     profile = get_provider_profile(normalized)
+    if profile and profile.auth_type == "external_process":
+        # External-process providers have no api_key/base_url: the profile's fetch_models drives its
+        # own subprocess. A failed launch degrades to the profile's pinned fallback_models.
+        try:
+            live = profile.fetch_models()
+        except Exception as exc:
+            logger.debug("external_process catalog fetch failed for %s: %s", normalized, exc)
+            live = None
+        if not live:
+            return list(profile.fallback_models) or None
+        return _merge_unique(list(live), list(profile.fallback_models or ()), key=_model_dedup_key)
     if not (profile and profile.auth_type == "api_key" and profile.base_url):
         return None
     api_key, base_url = _api_key_credentials(normalized)

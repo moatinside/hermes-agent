@@ -1874,6 +1874,19 @@ def get_model_context_length(
         logger.info("No model id provided for context length resolution — defaulting to %s tokens.", f"{DEFAULT_FALLBACK_CONTEXT:,}")
         return DEFAULT_FALLBACK_CONTEXT
     model = _strip_provider_prefix(model)  # "local:x" -> "x"; Ollama "model:tag" colons preserved
+    # Provider plugins may know a native window that Hermes' generic catalog cannot infer safely.
+    # Consult that explicit hook before endpoint probes and family-based defaults; an absent or
+    # invalid hook result leaves every existing provider on the legacy resolution path.
+    try:
+        from providers import get_provider_profile
+        profile = get_provider_profile(provider) if provider else None
+        profile_context = getattr(profile, "get_model_context_length", None)
+        if callable(profile_context):
+            profile_value = profile_context(model)
+            if isinstance(profile_value, int) and not isinstance(profile_value, bool) and profile_value > 0:
+                return profile_value
+    except Exception as exc:
+        logger.debug("provider profile context lookup failed for %s/%s: %s", provider, model, exc)
     # Endpoint-scoped metadata goes AHEAD of the persistent cache so a value learned on a
     # multiplexed provider's other endpoint cannot override it.
     endpoint_context = _endpoint_scoped_context_length(model, base_url)
