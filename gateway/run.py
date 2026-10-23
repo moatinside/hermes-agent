@@ -3388,6 +3388,16 @@ class GatewayRunner(
                 evaluator_configuration_id=evaluator_id,
                 evidence_output=output,
                 timeout_seconds=cfg.timeout_seconds,
+                allowed_platforms=cfg.allowed_platforms,
+                allowed_chat_refs=cfg.allowed_chat_refs,
+                required_patterns=cfg.required_patterns,
+                forbidden_patterns=cfg.forbidden_patterns,
+                capture_runtime_evidence=(
+                    cfg.capture_runtime_evidence is True
+                    and cfg.mode == "shadow"
+                    and bool(cfg.allowed_platforms)
+                    and bool(cfg.allowed_chat_refs)
+                ),
             )
             self.pre_delivery_gate_mode = cfg.mode
             if cfg.mode == "strict":
