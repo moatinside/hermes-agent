@@ -3330,6 +3330,7 @@ class GatewayRunner(
         self.pre_delivery_gate = None
         self.pre_delivery_gate_mode = "shadow"
         self._init_evaluator_shadow()
+        self._init_runtime_evidence_observer()
         # Multiplexer flag flips agent.secret_scope.get_secret() to fail-closed on unscoped credential
         # reads, so a missed migration crashes loudly instead of leaking a cross-profile value.
         try:
@@ -3398,6 +3399,21 @@ class GatewayRunner(
                 logger.info("Evaluator Shadow gate configured (opt-in; delivery remains Shadow)")
         except Exception:
             logger.warning("Evaluator Shadow disabled: adapter initialization failed", exc_info=True)
+
+    # Injected HMAC key provider (tests); otherwise built from ``hmac_key_source: keychain``.
+    # Without either the Runtime Evidence V2 observer stays unconstructed even when configured.
+    runtime_evidence_key_provider = None
+
+    def _init_runtime_evidence_observer(self, key_provider=None) -> None:
+        """Construct the metadata-only V2 observer only from a complete versioned opt-in."""
+        self.runtime_evidence_observer = None
+        cfg = getattr(self.config, "runtime_evidence", None)
+        if cfg is None or not getattr(cfg, "enabled", False):
+            return
+        from gateway.runtime_evidence_keychain import build_keychain_key_provider
+        from gateway.runtime_evidence_observer import build_runtime_evidence_observer
+        provider = key_provider or self.runtime_evidence_key_provider or build_keychain_key_provider(cfg)
+        self.runtime_evidence_observer = build_runtime_evidence_observer(cfg, provider)
 
     def _init_runtime_settings(self) -> None:
         """Load ephemeral per-call config (prefill, reasoning, busy modes, timeouts, routing)."""

@@ -1681,6 +1681,9 @@ class TurnRunner:
             "error": result.get("error"),
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),
+            # Finalizer persistence result for the Runtime Evidence observer; None when the
+            # turn returned before finalize_turn (preflight timeout, codex app-server, partial exit).
+            "persistence_confirmed": result.get("persistence_confirmed"),
             "tools": ctx.tools_holder[0] or [],
             "history_offset": history_offset, "compacted_in_place": compacted_in_place, "session_id": effective_session_id,
             **usage,

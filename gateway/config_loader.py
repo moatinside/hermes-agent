@@ -85,6 +85,9 @@ _TOPLEVEL_BRIDGE: tuple = (
     ),
     ("unauthorized_dm_behavior", "unauthorized_dm_behavior", "presence", None, _dm_behavior_choice),
     ("evaluator_shadow", "evaluator_shadow", "presence", lambda v: isinstance(v, dict), None),
+    # Runtime Evidence V2 opt-in (RuntimeEvidenceConfig); without this bridge a config.yaml
+    # block would be silently dropped and capture could only be configured via gateway.json.
+    ("runtime_evidence", "runtime_evidence", "presence", lambda v: isinstance(v, dict), None),
 )
 
 

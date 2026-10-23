@@ -1184,6 +1184,7 @@ class GatewayInboundMixin:
 
         _paused_notice = self._hm_estop_gate(event, source, is_internal)
         if _paused_notice is not None:
+            self._hm_record_skipped_turn(source)
             return _paused_notice
 
         _quick_key = self._session_key_for_source(source)
@@ -1207,6 +1208,7 @@ class GatewayInboundMixin:
         if not is_internal:
             if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
                 # Debounced so a user who forgets about topic mode doesn't get ten reminders.
+                self._hm_record_skipped_turn(source)
                 if self._should_send_telegram_lobby_reminder(source):
                     return self._telegram_topic_root_lobby_message()
                 return None
@@ -1215,6 +1217,7 @@ class GatewayInboundMixin:
             # only fall to zero. Reversible.
             if self._external_drain_active:
                 logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
+                self._hm_record_skipped_turn(source)
                 return (
                     "⏳ This agent is draining for a maintenance action and isn't "
                     "accepting new turns right now. It'll be back in a moment — "
@@ -1227,6 +1230,7 @@ class GatewayInboundMixin:
         _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
         if _limit_message is not None:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
+            self._hm_record_skipped_turn(source)
             return _limit_message
 
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
@@ -1251,6 +1255,7 @@ class GatewayInboundMixin:
                     "the user must resend",
                     _quick_key, exc.session_id,
                 )
+                self._hm_record_skipped_turn(source)
                 return (
                     "⏳ Another turn is still running on this session. To "
                     "protect the transcript, this message was not processed. "
@@ -1284,6 +1289,16 @@ class GatewayInboundMixin:
             # and the old sentinel-only check here missed the leftover real agent — locking the session out
             # forever (#28686).
             self._release_turn_lease(_quick_key, _run_generation)
+
+    def _hm_record_skipped_turn(self, source: SessionSource) -> None:
+        """Runtime Evidence V2: settle a gated/rejected message as ``skipped``. Never raises."""
+        _record = getattr(self, "_runtime_evidence_record_skipped", None)
+        if _record is None:
+            return
+        try:
+            _record(source)
+        except Exception:
+            pass
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn (called from the
