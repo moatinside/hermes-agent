@@ -630,6 +630,19 @@ def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=N
     return finish(raw_response)
 
 
+def _provider_chat_completion_create(client: Any, api_kwargs: dict) -> Any:
+    """Call a provider client without letting ambient asyncio state change its contract.
+
+    The synchronous main turn loop opts in to the private sync marker only for
+    provider clients that declare it; ordinary SDK clients receive the original
+    request payload unchanged.
+    """
+    if getattr(client, "HERMES_SYNC_PROVIDER", False):
+        api_kwargs = dict(api_kwargs)
+        api_kwargs["_hermes_sync"] = True
+    return client.chat.completions.create(**api_kwargs)
+
+
 def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
@@ -658,7 +671,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         if not callable(getattr(_completions, "prepare", None)):
             api_kwargs.pop("_moa_prepared_request", None)
         return agent.client.chat.completions.create(**api_kwargs)
-    return make_client("chat_completion_request").chat.completions.create(**api_kwargs)
+    return _provider_chat_completion_create(make_client("chat_completion_request"), api_kwargs)
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -2871,7 +2884,7 @@ class _StreamingCall:
             self.agent._create_request_openai_client(reason="chat_completion_stream_request", api_kwargs=stream_kwargs))
         self.last_chunk_time["t"] = time.time()
         self.agent._touch_activity("waiting for provider response (streaming)")
-        return request_client.chat.completions.create(**stream_kwargs)
+        return _provider_chat_completion_create(request_client, stream_kwargs)
 
     def _chat_stream_created(self, raw_stream: Any) -> None:
         response = self._attempt_stream_response = getattr(raw_stream, "response", None)
