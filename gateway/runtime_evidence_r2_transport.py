@@ -3,7 +3,8 @@
 This module contains no Cloudflare SDK, credentials, configuration lookup, or
 network setup. The injected transport contract requires exactly one network
 attempt per method call; SDK-level automatic retries must be disabled by any
-future concrete adapter. This module is not wired into the Gateway runtime.
+concrete adapter. The Gateway reaches it only through the opt-in settle-marker
+journal (``gateway/runtime_evidence_r2_settle.py``).
 """
 
 from __future__ import annotations
@@ -60,6 +61,9 @@ class BudgetedR2ObjectJournal:
     not Cloudflare's monthly billing meter, and excludes other account users.
     """
 
+    KEY_PREFIX = _OBJECT_KEY_PREFIX
+    KEY_DOMAIN = _OBJECT_KEY_DOMAIN
+
     def __init__(
         self,
         *,
@@ -84,8 +88,8 @@ class BudgetedR2ObjectJournal:
         self._transport = transport
         self._validator = validator
 
-    @staticmethod
-    def _identity(object_ref: str, payload: bytes) -> tuple[str, str]:
+    @classmethod
+    def _identity(cls, object_ref: str, payload: bytes) -> tuple[str, str]:
         if not isinstance(object_ref, str) or not object_ref:
             raise R2TransportError("transport_request_invalid")
         try:
@@ -100,10 +104,8 @@ class BudgetedR2ObjectJournal:
             or len(payload) > MAX_ENVELOPE_BYTES
         ):
             raise R2TransportError("transport_request_invalid")
-        object_ref_hash = hashlib.sha256(
-            _OBJECT_KEY_DOMAIN + identity_bytes
-        ).hexdigest()
-        return object_ref_hash, _OBJECT_KEY_PREFIX + object_ref_hash
+        object_ref_hash = hashlib.sha256(cls.KEY_DOMAIN + identity_bytes).hexdigest()
+        return object_ref_hash, cls.KEY_PREFIX + object_ref_hash
 
     def _validate_payload(self, object_ref: str, payload: bytes) -> None:
         if (
