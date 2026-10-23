@@ -575,6 +575,54 @@ class EvaluatorShadowConfig:
         return asdict(self)
 
 
+def _string_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item]
+
+
+@dataclass
+class RuntimeEvidenceConfig:
+    """Versioned, explicit opt-in for metadata-only Runtime Evidence V2 capture.
+
+    Default OFF. The observer (gateway/runtime_evidence_observer.py) is built only when
+    ``enabled`` is true, ``config_version`` matches, an explicit ``outbox_path`` and
+    non-empty platform/chat/profile allowlists are given, ``max_events`` is bounded, and
+    an HMAC key provider is injected. No path, scope, or key is inferred.
+    """
+    config_version: Optional[int] = None
+    enabled: bool = False
+    outbox_path: Optional[str] = None
+    platforms: List[str] = field(default_factory=list)
+    chat_ids: List[str] = field(default_factory=list)
+    profiles: List[str] = field(default_factory=list)
+    max_events: int = 1
+    # HMAC key custody: only "keychain" is accepted (gateway/runtime_evidence_keychain.py).
+    hmac_key_source: Optional[str] = None
+    hmac_key_version: Optional[int] = 1
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RuntimeEvidenceConfig":
+        data = _coerce_dict(data)
+        version = data.get("config_version")
+        max_events = data.get("max_events")
+        key_version = data.get("hmac_key_version", 1)
+        return cls(
+            config_version=version if type(version) is int else None,
+            enabled=data.get("enabled") is True,
+            outbox_path=data.get("outbox_path") if isinstance(data.get("outbox_path"), str) else None,
+            platforms=_string_list(data.get("platforms")),
+            chat_ids=_string_list(data.get("chat_ids")),
+            profiles=_string_list(data.get("profiles")),
+            max_events=max_events if type(max_events) is int else 1,
+            hmac_key_source="keychain" if data.get("hmac_key_source") == "keychain" else None,
+            hmac_key_version=key_version if type(key_version) is int and key_version >= 1 else None,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 @dataclass
 class GatewayConfig:
     """Main gateway configuration: platform connections, session policies, delivery settings."""
@@ -627,6 +675,7 @@ class GatewayConfig:
     session_store_max_age_days: int = 90
     profile_routes: list = field(default_factory=list)  # gateway/profile_routing.py
     evaluator_shadow: EvaluatorShadowConfig = field(default_factory=EvaluatorShadowConfig)
+    runtime_evidence: RuntimeEvidenceConfig = field(default_factory=RuntimeEvidenceConfig)
 
     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
     _SCALAR_DICT_FIELDS = (
@@ -714,6 +763,7 @@ class GatewayConfig:
                 asdict(r) if is_dataclass(r) and not isinstance(r, type) else r for r in self.profile_routes
             ],
             "evaluator_shadow": self.evaluator_shadow.to_dict(),
+            "runtime_evidence": self.runtime_evidence.to_dict(),
         }
 
     @classmethod
@@ -810,6 +860,10 @@ class GatewayConfig:
             evaluator_shadow=EvaluatorShadowConfig.from_dict(
                 data["evaluator_shadow"] if "evaluator_shadow" in data
                 else nested_gateway.get("evaluator_shadow", {})
+            ),
+            runtime_evidence=RuntimeEvidenceConfig.from_dict(
+                data["runtime_evidence"] if "runtime_evidence" in data
+                else nested_gateway.get("runtime_evidence", {})
             ),
         )
 

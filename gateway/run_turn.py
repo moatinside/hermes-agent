@@ -3923,6 +3923,31 @@ class GatewayTurnMixin:
             except Exception as _ne:
                 logger.debug("Long-running notification error: %s", _ne)
 
+    def _runtime_evidence_begin_turn(self, source: SessionSource, session_id: str) -> Any:
+        """Per-turn V2 observation handle, or None when capture is off/out of scope. Never raises."""
+        observer = getattr(self, "runtime_evidence_observer", None)
+        if observer is None:
+            return None
+        try:
+            return observer.begin_turn(source, session_id)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _runtime_evidence_settle(turn: Any, response: Any, exc: Optional[BaseException]) -> None:
+        """Metadata-only settlement; cannot alter ``response`` or raise into the turn."""
+        if turn is None:
+            return
+        try:
+            turn.settle(response, exc)
+        except Exception:
+            pass
+
+    def _runtime_evidence_record_skipped(self, source: SessionSource) -> None:
+        """Settle an in-scope message that was deliberately not run as a turn (gate/drain/limit
+        rejection) as ``skipped``. Uses its own marker dict; the caller's reply is untouched."""
+        self._runtime_evidence_settle(self._runtime_evidence_begin_turn(source, None), {"skipped": True}, None)
+
     async def _run_agent_inner(
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
         source: SessionSource, session_id: str, session_key: str = None,
@@ -3936,11 +3961,20 @@ class GatewayTurnMixin:
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
-            return await self._run_agent_via_proxy(
-                message=message, context_prompt=context_prompt, history=history, source=source,
-                session_id=session_id, session_key=session_key, run_generation=run_generation,
-                event_message_id=event_message_id,
-            )
+            # Proxy turns settle once here with the same semantics as the local path; error and
+            # stale-generation results carry no ``completed`` key and therefore settle ``unknown``.
+            _proxy_evidence_turn = self._runtime_evidence_begin_turn(source, session_id)
+            try:
+                _proxy_result = await self._run_agent_via_proxy(
+                    message=message, context_prompt=context_prompt, history=history, source=source,
+                    session_id=session_id, session_key=session_key, run_generation=run_generation,
+                    event_message_id=event_message_id,
+                )
+            except BaseException as _proxy_exc:
+                self._runtime_evidence_settle(_proxy_evidence_turn, None, _proxy_exc)
+                raise
+            self._runtime_evidence_settle(_proxy_evidence_turn, _proxy_result, None)
+            return _proxy_result
 
         from run_agent import AIAgent
 
@@ -3978,11 +4012,19 @@ class GatewayTurnMixin:
         _executor_task_holder: list = [None]  # bound once the executor future exists (see below)
         _notify_task = spawn(self._run_agent_notify_long_running(disp, turn_ctx, _executor_task_holder))
 
+        _evidence_turn = self._runtime_evidence_begin_turn(source, session_id)
         try:
             # run_sync is TurnRunner.run_sync (bound method; executor call unchanged).
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
             _executor_task_holder[0] = worker.executor_task  # read late by _notify_long_running
-            response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
+            try:
+                response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
+            except BaseException as _turn_exc:
+                self._runtime_evidence_settle(_evidence_turn, None, _turn_exc)
+                raise
+            # Settled once, after run_sync returned (finalizer persistence result included) and
+            # before delivery; the Outbox write runs on the observer's worker, never awaited here.
+            self._runtime_evidence_settle(_evidence_turn, response, None)
             self._run_agent_evict_on_fallback(turn_ctx)
 
             # Interrupted OR queued message (/queue)?
