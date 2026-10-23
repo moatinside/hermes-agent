@@ -4,7 +4,9 @@ The observer classifies a turn result that the Gateway already holds, builds an
 allowlisted V2 ``turn_settled`` envelope, and hands it to a single background
 worker that writes the local durable Outbox. It never reads message text, tool
 arguments, or raw identifiers into the envelope, never starts the Evaluator, and
-never waits for a consumer, report, or the Outbox write. Every failure is
+never waits for a consumer, report, or the Outbox write. With an opt-in remote
+journal, a second worker writes one R2 settle marker per settled turn regardless of
+the Outbox outcome (the independent capture denominator). Every failure is
 counted under a value-free code and swallowed so the response, its delivery, and
 canonical persistence are unchanged.
 
@@ -225,8 +227,10 @@ class RuntimeEvidenceObserver:
         max_events: int,
         queue_size: int = 16,
         clock: Callable[[], datetime] | None = None,
+        journal: Any = None,
     ) -> None:
         self._outbox = outbox
+        self._journal = journal
         self._key_provider = key_provider
         self._platforms = platforms
         self._chat_ids = chat_ids
@@ -239,6 +243,10 @@ class RuntimeEvidenceObserver:
         self.counters: Dict[str, int] = {}
         self._worker = threading.Thread(target=self._drain, name="runtime-evidence-outbox", daemon=True)
         self._worker.start()
+        # Settle markers go to R2 on their own worker so remote latency never delays Outbox writes.
+        self._journal_queue: "queue.Queue[Any]" = queue.Queue(maxsize=max(1, queue_size))
+        if journal is not None:
+            threading.Thread(target=self._drain_journal, name="runtime-evidence-r2", daemon=True).start()
 
     def _count(self, code: str) -> None:
         with self._lock:
@@ -363,13 +371,50 @@ class RuntimeEvidenceObserver:
                     if isinstance(code, str) and code.startswith("keychain_"):
                         self._count("key_" + code)
                     continue
-                outcome = self._outbox.enqueue(envelope)
-                self._count("outbox_" + str(getattr(outcome, "status", "unknown")))
-            except Exception as exc:  # value-free: only the OutboxError code is kept
-                code = getattr(exc, "code", None)
-                self._count("outbox_error_" + (code if isinstance(code, str) else "unexpected"))
+                status, error_code = None, None
+                try:
+                    status = getattr(self._outbox.enqueue(envelope), "status", "unknown")
+                    self._count("outbox_" + str(status))
+                except Exception as exc:  # value-free: only the OutboxError code is kept
+                    code = getattr(exc, "code", None)
+                    error_code = code if isinstance(code, str) else "unexpected"
+                    self._count("outbox_error_" + error_code)
+                self._queue_settle_marker(envelope, status, error_code)
+            except Exception:
+                self._count("drain_failed")
             finally:
                 self._queue.task_done()
+
+    def _queue_settle_marker(self, envelope: dict, status: Any, error_code: Any) -> None:
+        """Hand the independent denominator marker to the R2 worker; the Outbox outcome is only data."""
+        if self._journal is None:
+            return
+        try:
+            from gateway.runtime_evidence_r2_settle import build_settle_marker, outbox_outcome
+
+            marker = build_settle_marker(
+                envelope["event_ref"], envelope["execution"]["ended_at"],
+                envelope["execution"]["terminal_status"], outbox_outcome(status, error_code),
+            )
+            self._journal_queue.put_nowait((envelope["event_ref"], marker))
+        except queue.Full:
+            self._count("journal_queue_full_dropped")
+        except Exception:
+            self._count("journal_marker_failed")
+
+    def _drain_journal(self) -> None:
+        while True:
+            item = self._journal_queue.get()
+            try:
+                if item is None:
+                    return
+                result = self._journal.write_once(*item)
+                self._count("journal_" + str(getattr(result, "status", "unknown")))
+            except Exception as exc:  # value-free: only the transport/budget code is kept
+                code = getattr(exc, "code", None)
+                self._count("journal_error_" + (code if isinstance(code, str) else "unexpected"))
+            finally:
+                self._journal_queue.task_done()
 
     def flush(self, timeout: float = 5.0) -> bool:
         """Test/shutdown helper: wait for queued writes. Not called on the response path."""
@@ -377,16 +422,18 @@ class RuntimeEvidenceObserver:
 
         def _join() -> None:
             self._queue.join()
+            self._journal_queue.join()
             done.set()
 
         threading.Thread(target=_join, daemon=True).start()
         return done.wait(timeout)
 
     def close(self) -> None:
-        try:
-            self._queue.put_nowait(None)
-        except queue.Full:
-            pass
+        for pending in (self._queue, self._journal_queue):
+            try:
+                pending.put_nowait(None)
+            except queue.Full:
+                pass
 
 
 def build_runtime_evidence_observer(cfg: Any, key_provider: Optional[KeyProvider]) -> Optional[RuntimeEvidenceObserver]:
@@ -414,9 +461,17 @@ def build_runtime_evidence_observer(cfg: Any, key_provider: Optional[KeyProvider
         from gateway.runtime_evidence_outbox import DurableRuntimeEvidenceOutbox
 
         outbox = DurableRuntimeEvidenceOutbox(Path(outbox_path).expanduser(), validator=validate_envelope)
+        journal = None
+        remote = getattr(cfg, "remote_journal", None)
+        if getattr(remote, "enabled", False) is True:
+            from gateway.runtime_evidence_r2_settle import build_remote_settle_journal
+
+            journal = build_remote_settle_journal(remote)
+            if journal is None:
+                logger.warning("Runtime evidence remote journal disabled: incomplete configuration")
         return RuntimeEvidenceObserver(
             outbox, key_provider=key_provider, platforms=platforms, chat_ids=chat_ids,
-            profiles=profiles, max_events=max_events,
+            profiles=profiles, max_events=max_events, journal=journal,
         )
     except Exception:
         logger.warning("Runtime evidence observer disabled: initialization failed")

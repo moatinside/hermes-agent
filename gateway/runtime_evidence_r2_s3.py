@@ -1,9 +1,10 @@
 """Optional macOS-Keychain-backed S3 API adapter for Cloudflare R2.
 
-This adapter is deliberately not wired into the Gateway runtime. It reads one
-Generic Password item at runtime, keeps credential material in process memory,
-and performs one S3 API request per transport method. The caller must place it
-behind BudgetedR2ObjectJournal.
+The Gateway uses it only through the opt-in settle-marker journal
+(``gateway/runtime_evidence_r2_settle.py``). It reads one Generic Password item
+at runtime, keeps credential material in process memory, and performs one S3 API
+request per transport method. The caller must place it behind a budget ledger
+(``BudgetedR2ObjectJournal`` for writes, ``R2UsageBudget.execute`` for listing).
 """
 
 from __future__ import annotations
@@ -266,6 +267,34 @@ class Boto3R2ObjectTransport(R2ObjectTransport):
         if type(stored) is not bytes or len(stored) > MAX_ENVELOPE_BYTES:
             raise R2TransportError("r2_s3_response_invalid")
         return stored
+
+    def list_keys_once(
+        self, bucket: str, prefix: str, continuation_token: str | None = None, max_keys: int = 1000,
+    ) -> tuple[list[str], str | None]:
+        """One ListObjectsV2 page (an R2 Class A operation): ``(keys, next_token)``."""
+        if (
+            not isinstance(bucket, str) or not bucket
+            or not isinstance(prefix, str) or not prefix
+            or type(max_keys) is not int or not 1 <= max_keys <= 1000
+        ):
+            raise R2TransportError("transport_request_invalid")
+        kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": max_keys}
+        if continuation_token is not None:
+            kwargs["ContinuationToken"] = continuation_token
+        try:
+            response = self._client.list_objects_v2(**kwargs)
+        except Exception:
+            raise R2TransportError("r2_s3_list_failed") from None
+        if not isinstance(response, dict):
+            raise R2TransportError("r2_s3_response_invalid")
+        keys = [
+            item.get("Key") for item in response.get("Contents") or []
+            if isinstance(item, dict) and isinstance(item.get("Key"), str)
+        ]
+        token = response.get("NextContinuationToken") if response.get("IsTruncated") is True else None
+        if token is not None and not isinstance(token, str):
+            raise R2TransportError("r2_s3_response_invalid")
+        return keys, token
 
 
 def create_budgeted_r2_journal_from_keychain(

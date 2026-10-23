@@ -600,6 +600,47 @@ def _string_list(value: Any) -> List[str]:
 
 
 @dataclass
+class RuntimeEvidenceRemoteJournalConfig:
+    """Explicit opt-in for the R2 settle-marker journal (independent capture denominator).
+
+    Default OFF. Built only when ``enabled`` is exactly true and bucket, Cloudflare
+    account id, a pre-initialized budget ledger path, and positive budget caps are all
+    given. Credentials come from the macOS Keychain item named ``keychain_label``.
+    """
+    enabled: bool = False
+    bucket: Optional[str] = None
+    account_id: Optional[str] = None
+    budget_path: Optional[str] = None
+    max_class_a_operations: Optional[int] = None
+    max_class_b_operations: Optional[int] = None
+    max_reserved_storage_bytes: Optional[int] = None
+    keychain_label: str = "R2Key"
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "RuntimeEvidenceRemoteJournalConfig":
+        data = _coerce_dict(data)
+
+        def _positive(name: str) -> Optional[int]:
+            value = data.get(name)
+            return value if type(value) is int and value > 0 else None
+
+        def _text(name: str) -> Optional[str]:
+            value = data.get(name)
+            return value if isinstance(value, str) and value.strip() else None
+
+        return cls(
+            enabled=data.get("enabled") is True,
+            bucket=_text("bucket"),
+            account_id=_text("account_id"),
+            budget_path=_text("budget_path"),
+            max_class_a_operations=_positive("max_class_a_operations"),
+            max_class_b_operations=_positive("max_class_b_operations"),
+            max_reserved_storage_bytes=_positive("max_reserved_storage_bytes"),
+            keychain_label=_text("keychain_label") or "R2Key",
+        )
+
+
+@dataclass
 class RuntimeEvidenceConfig:
     """Versioned, explicit opt-in for metadata-only Runtime Evidence V2 capture.
 
@@ -618,6 +659,9 @@ class RuntimeEvidenceConfig:
     # HMAC key custody: only "keychain" is accepted (gateway/runtime_evidence_keychain.py).
     hmac_key_source: Optional[str] = None
     hmac_key_version: Optional[int] = 1
+    remote_journal: RuntimeEvidenceRemoteJournalConfig = field(
+        default_factory=RuntimeEvidenceRemoteJournalConfig
+    )
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RuntimeEvidenceConfig":
@@ -635,6 +679,7 @@ class RuntimeEvidenceConfig:
             max_events=max_events if type(max_events) is int else 1,
             hmac_key_source="keychain" if data.get("hmac_key_source") == "keychain" else None,
             hmac_key_version=key_version if type(key_version) is int and key_version >= 1 else None,
+            remote_journal=RuntimeEvidenceRemoteJournalConfig.from_dict(data.get("remote_journal")),
         )
 
     def to_dict(self) -> Dict[str, Any]:
